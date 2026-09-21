@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Diagrama de Entidades AVEX</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="title-bar">
+  <h1><span class="accent-letter">A</span>VEX</h1>
+  <p>Diagrama de Entidades</p>
+</div>
+
+<div id="toolbar">
+  <input id="search" type="text" placeholder="Buscar tabla o columna..." autocomplete="off">
+  <span id="match-count"></span>
+  <div class="sep"></div>
+  <button class="btn" id="zoom-in" title="Acercar">+</button>
+  <button class="btn" id="zoom-out" title="Alejar">&minus;</button>
+  <button class="btn" id="zoom-fit" title="Ajustar todo">Ajustar</button>
+  <button class="btn" id="zoom-reset" title="Restablecer">100%</button>
+  <div class="sep"></div>
+  <span id="stats"></span>
+  <div style="flex:1"></div>
+  <a class="btn" id="download-link" href="#" download style="text-decoration:none;">Descargar .graphml</a>
+</div>
+
+<div id="status"></div>
+
+<div id="canvas-wrap">
+  <svg id="diagram" xmlns="http://www.w3.org/2000/svg"></svg>
+</div>
+
+<div id="legend">
+  <span><svg width="20" height="14"><circle cx="10" cy="7" r="4" fill="#141414" stroke="#9a9a9a" stroke-width="1.4"/></svg>lado "muchos"</span>
+  <span><svg width="20" height="14"><polygon points="10,2 16,7 10,12 4,7" fill="#141414" stroke="#9a9a9a" stroke-width="1.4"/></svg>lado opcional</span>
+  <span><svg width="26" height="10"><line x1="0" y1="5" x2="26" y2="5" stroke="#9a9a9a" stroke-width="1.4"/></svg>relación identificadora</span>
+  <span><svg width="26" height="10"><line x1="0" y1="5" x2="26" y2="5" stroke="#9a9a9a" stroke-width="1.4" stroke-dasharray="5,4"/></svg>relación no identificadora</span>
+</div>
+<div id="hint">Arrastrá el fondo para mover &middot; rueda para zoom &middot; clic en una tabla para resaltar relaciones &middot; arrastrá una tabla para reordenar</div>
+
+<script>
+const GRAPHML_FILE = "domicilios 2 - baseApi - avex.graphml";
+
+const svgNS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById("diagram");
+const wrap = document.getElementById("canvas-wrap");
+const statusEl = document.getElementById("status");
+
+document.getElementById("download-link").href = encodeURI(GRAPHML_FILE);
+
+function showError(msg) {
+  statusEl.style.display = "block";
+  statusEl.innerHTML = msg;
+}
+
+fetch(encodeURI(GRAPHML_FILE))
+  .then(r => {
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.text();
+  })
+  .then(text => init(text))
+  .catch(err => {
+    showError(
+      "No se pudo cargar <code>" + GRAPHML_FILE + "</code> (" + err.message + "). " +
+      "Si estás abriendo este archivo localmente con <code>file://</code>, los navegadores bloquean esa carga por CORS. " +
+      "Probá con un servidor local, por ejemplo: <code>python3 -m http.server</code> y abrí <code>http://localhost:8000</code>, " +
+      "o publicá el repositorio en GitHub Pages."
+    );
+  });
+
+function init(xmlText) {
+  const doc = new DOMParser().parseFromString(xmlText, "application/xml");
+  const parseErr = doc.querySelector("parsererror");
+  if (parseErr) {
+    showError("Error al interpretar el GraphML: " + parseErr.textContent);
+    return;
+  }
+
+  const entities = {};
+  const nodeEls = doc.getElementsByTagName("node");
+  for (const nodeEl of nodeEls) {
+    const id = nodeEl.getAttribute("id");
+    const generic = nodeEl.getElementsByTagName("y:GenericNode")[0];
+    if (!generic) continue;
+    const geom = generic.getElementsByTagName("y:Geometry")[0];
+    const labels = generic.getElementsByTagName("y:NodeLabel");
+    let name = "", attrsText = "";
+    for (const lbl of labels) {
+      const cfg = lbl.getAttribute("configuration") || "";
+      if (cfg.indexOf("label.name") !== -1) name = lbl.textContent.trim();
+      else if (cfg.indexOf("label.attributes") !== -1) attrsText = lbl.textContent;
+    }
+    const attrs = attrsText.split("\n").map(s => s.trim()).filter(s => s.length > 0);
+    entities[id] = {
+      id, name, attrs,
+      x: geom ? parseFloat(geom.getAttribute("x")) : 0,
+      y: geom ? parseFloat(geom.getAttribute("y")) : 0
+    };
+  }
+
+  const edges = [];
+  const edgeEls = doc.getElementsByTagName("edge");
+  for (const edgeEl of edgeEls) {
+    const source = edgeEl.getAttribute("source");
+    const target = edgeEl.getAttribute("target");
+    const poly = edgeEl.getElementsByTagName("y:PolyLineEdge")[0];
+    let dashed = false, arrowSource = "none", arrowTarget = "none";
+    if (poly) {
+      const lineStyle = poly.getElementsByTagName("y:LineStyle")[0];
+      if (lineStyle) dashed = lineStyle.getAttribute("type") === "dashed";
+      const arrows = poly.getElementsByTagName("y:Arrows")[0];
+      if (arrows) {
+        arrowSource = arrows.getAttribute("source") || "none";
+        arrowTarget = arrows.getAttribute("target") || "none";
+      }
+    }
+    edges.push({ id: edgeEl.getAttribute("id"), source, target, dashed, arrowSource, arrowTarget });
+  }
+
+  render(entities, edges);
+}
+
+function measureTextWidth(str, font) {
+  measureTextWidth.canvas = measureTextWidth.canvas || document.createElement("canvas");
+  const ctx = measureTextWidth.canvas.getContext("2d");
+  ctx.font = font;
+  return ctx.measureText(str).width;
+}
+
+function render(entities, edges) {
+  const PADDING = 10;
+  const HEADER_H = 30;
+  const LINE_H = 15;
+  const NAME_FONT = "700 16px 'Courier New', monospace";
+  const ATTR_FONT = "12px 'Courier New', monospace";
+  const MIN_WIDTH = 130;
+  const COL_THRESHOLD = 60;
+  const V_GAP = 30;
+  const H_GAP = 90;
+  const MAX_COL_H = 420;
+
+  // compute size of each entity from its content
+  const nodesById = {};
+  for (const id in entities) {
+    const e = entities[id];
+    let maxTextW = measureTextWidth(e.name, NAME_FONT);
+    for (const a of e.attrs) maxTextW = Math.max(maxTextW, measureTextWidth(a, ATTR_FONT));
+    const w = Math.max(MIN_WIDTH, maxTextW + PADDING * 2);
+    const h = HEADER_H + PADDING * 2 + e.attrs.length * LINE_H;
+    nodesById[id] = { ...e, w, h };
+  }
+
+  // Re-layout into columns: group tables by their original x-position into lanes,
+  // pack each lane tightly (no overlap, using real box heights), then space lanes
+  // further apart horizontally so the diagram reads wider than it is tall.
+  {
+    const ids = Object.keys(nodesById);
+    const sortedByX = ids.slice().sort((a, b) => nodesById[a].x - nodesById[b].x);
+    const columns = [];
+    for (const id of sortedByX) {
+      const n = nodesById[id];
+      const col = columns[columns.length - 1];
+      if (!col || n.x - col.x0 > COL_THRESHOLD) {
+        columns.push({ x0: n.x, ids: [id] });
+      } else {
+        col.ids.push(id);
+      }
+    }
+    // balance overly tall columns by splitting them into side-by-side sub-columns
+    const lanes = [];
+    for (const col of columns) {
+      const idsSorted = col.ids.slice().sort((a, b) => nodesById[a].y - nodesById[b].y);
+      let totalH = 0;
+      for (const id of idsSorted) totalH += nodesById[id].h + V_GAP;
+      const nSub = Math.max(1, Math.ceil(totalH / MAX_COL_H));
+      if (nSub === 1) { lanes.push(idsSorted); continue; }
+      const target = totalH / nSub;
+      let cur = [], curH = 0, cuts = 0;
+      for (const id of idsSorted) {
+        cur.push(id);
+        curH += nodesById[id].h + V_GAP;
+        if (curH >= target * (cuts + 1) && cuts < nSub - 1) {
+          lanes.push(cur);
+          cur = [];
+          cuts++;
+        }
+      }
+      if (cur.length) lanes.push(cur);
+    }
+
+    let curX = 0;
+    for (const laneIds of lanes) {
+      let curY = 0, maxW = 0;
+      for (const id of laneIds) {
+        const n = nodesById[id];
+        n.x = curX;
+        n.y = curY;
+        curY += n.h + V_GAP;
+        maxW = Math.max(maxW, n.w);
+      }
+      curX += maxW + H_GAP;
+    }
+  }
+
+  // build svg structure
+  svg.innerHTML = "";
+  const defs = document.createElementNS(svgNS, "defs");
+  defs.innerHTML = `
+    <marker id="m-circle" viewBox="0 0 20 20" refX="18" refY="10" markerWidth="14" markerHeight="14" orient="auto-start-reverse">
+      <circle cx="10" cy="10" r="7" fill="#181818" stroke="#9a9a9a" stroke-width="2"/>
+    </marker>
+    <marker id="m-diamond" viewBox="0 0 20 20" refX="18" refY="10" markerWidth="16" markerHeight="16" orient="auto-start-reverse">
+      <polygon points="10,1 19,10 10,19 1,10" fill="#181818" stroke="#9a9a9a" stroke-width="2"/>
+    </marker>
+  `;
+  svg.appendChild(defs);
+
+  const edgeLayer = document.createElementNS(svgNS, "g");
+  edgeLayer.setAttribute("class", "edges");
+  svg.appendChild(edgeLayer);
+
+  const nodeLayer = document.createElementNS(svgNS, "g");
+  nodeLayer.setAttribute("class", "nodes");
+  svg.appendChild(nodeLayer);
+
+  const nodeGroups = {};
+  for (const id in nodesById) {
+    const n = nodesById[id];
+    const g = document.createElementNS(svgNS, "g");
+    g.setAttribute("class", "entity");
+    g.setAttribute("data-id", id);
+    g.setAttribute("transform", `translate(${n.x},${n.y})`);
+
+    const body = document.createElementNS(svgNS, "rect");
+    body.setAttribute("class", "body");
+    body.setAttribute("x", 0); body.setAttribute("y", HEADER_H);
+    body.setAttribute("width", n.w); body.setAttribute("height", n.h - HEADER_H);
+    g.appendChild(body);
+
+    const header = document.createElementNS(svgNS, "rect");
+    header.setAttribute("class", "header");
+    header.setAttribute("x", 0); header.setAttribute("y", 0);
+    header.setAttribute("width", n.w); header.setAttribute("height", HEADER_H);
+    g.appendChild(header);
+
+    const nameText = document.createElementNS(svgNS, "text");
+    nameText.setAttribute("class", "name");
+    nameText.setAttribute("x", n.w / 2); nameText.setAttribute("y", HEADER_H / 2 + 4);
+    nameText.setAttribute("text-anchor", "middle");
+    nameText.setAttribute("font-family", "'Courier New', monospace");
+    nameText.setAttribute("font-size", "16");
+    nameText.setAttribute("font-weight", "700");
+    nameText.textContent = n.name;
+    g.appendChild(nameText);
+
+    n.attrs.forEach((a, i) => {
+      const t = document.createElementNS(svgNS, "text");
+      t.setAttribute("class", "attr");
+      t.setAttribute("x", PADDING);
+      t.setAttribute("y", HEADER_H + PADDING + i * LINE_H + 10);
+      t.setAttribute("font-family", "'Courier New', monospace");
+      t.setAttribute("font-size", "12");
+      t.textContent = a;
+      g.appendChild(t);
+    });
+
+    nodeLayer.appendChild(g);
+    nodeGroups[id] = g;
+  }
+
+  function borderPoint(rect, otherCx, otherCy) {
+    const cx = rect.x + rect.w / 2, cy = rect.y + rect.h / 2;
+    const dx = otherCx - cx, dy = otherCy - cy;
+    if (dx === 0 && dy === 0) return { x: cx, y: cy };
+    const halfW = rect.w / 2, halfH = rect.h / 2;
+    const scaleX = dx !== 0 ? halfW / Math.abs(dx) : Infinity;
+    const scaleY = dy !== 0 ? halfH / Math.abs(dy) : Infinity;
+    const scale = Math.min(scaleX, scaleY);
+    return { x: cx + dx * scale, y: cy + dy * scale };
+  }
+
+  const edgeEls = {};
+  function edgePath(e) {
+    const s = nodesById[e.source], t = nodesById[e.target];
+    if (!s || !t) return "";
+    if (e.source === e.target) {
+      const x0 = s.x + s.w, y0 = s.y + s.h * 0.35;
+      const x1 = s.x + s.w, y1 = s.y + s.h * 0.65;
+      const bulge = 50;
+      return `M ${x0} ${y0} C ${x0 + bulge} ${y0 - 10}, ${x1 + bulge} ${y1 + 10}, ${x1} ${y1}`;
+    }
+    const sCenter = { x: s.x + s.w / 2, y: s.y + s.h / 2 };
+    const tCenter = { x: t.x + t.w / 2, y: t.y + t.h / 2 };
+    const p1 = borderPoint({ x: s.x, y: s.y, w: s.w, h: s.h }, tCenter.x, tCenter.y);
+    const p2 = borderPoint({ x: t.x, y: t.y, w: t.w, h: t.h }, sCenter.x, sCenter.y);
+    return `M ${p1.x} ${p1.y} L ${p2.x} ${p2.y}`;
+  }
+
+  function markerFor(type) {
+    if (type === "circle") return "url(#m-circle)";
+    if (type === "white_diamond") return "url(#m-diamond)";
+    return "";
+  }
+
+  for (const e of edges) {
+    const g = document.createElementNS(svgNS, "g");
+    g.setAttribute("class", "edge" + (e.dashed ? " dashed" : ""));
+    g.setAttribute("data-source", e.source);
+    g.setAttribute("data-target", e.target);
+    const path = document.createElementNS(svgNS, "path");
+    path.setAttribute("d", edgePath(e));
+    const mStart = markerFor(e.arrowSource);
+    const mEnd = markerFor(e.arrowTarget);
+    if (mStart) path.setAttribute("marker-start", mStart);
+    if (mEnd) path.setAttribute("marker-end", mEnd);
+    g.appendChild(path);
+    edgeLayer.appendChild(g);
+    edgeEls[e.id] = { g, path, e };
+  }
+
+  function refreshEdges() {
+    for (const key in edgeEls) {
+      const { path, e } = edgeEls[key];
+      path.setAttribute("d", edgePath(e));
+    }
+  }
+
+  // ---- bounding box / viewBox management ----
+  function computeBBox() {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const id in nodesById) {
+      const n = nodesById[id];
+      minX = Math.min(minX, n.x); minY = Math.min(minY, n.y);
+      maxX = Math.max(maxX, n.x + n.w); maxY = Math.max(maxY, n.y + n.h);
+    }
+    const pad = 80;
+    return { x: minX - pad, y: minY - pad, w: (maxX - minX) + pad * 2, h: (maxY - minY) + pad * 2 };
+  }
+
+  let view = computeBBox();
+  const nativeView = { ...view };
+  function applyView() {
+    svg.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${view.h}`);
+  }
+  applyView();
+
+  function clientToSvg(clientX, clientY) {
+    const pt = svg.createSVGPoint();
+    pt.x = clientX; pt.y = clientY;
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return { x: 0, y: 0 };
+    const p = pt.matrixTransform(ctm.inverse());
+    return { x: p.x, y: p.y };
+  }
+
+  // ---- zoom ----
+  function zoomBy(factor, centerClientX, centerClientY) {
+    const rect = wrap.getBoundingClientRect();
+    const cx = centerClientX !== undefined ? centerClientX : rect.left + rect.width / 2;
+    const cy = centerClientY !== undefined ? centerClientY : rect.top + rect.height / 2;
+    const before = clientToSvg(cx, cy);
+    const newW = Math.min(Math.max(view.w * factor, 200), nativeView.w * 8);
+    const newH = newW * (view.h / view.w);
+    view.x = before.x - (before.x - view.x) * (newW / view.w);
+    view.y = before.y - (before.y - view.y) * (newH / view.h);
+    view.w = newW; view.h = newH;
+    applyView();
+  }
+
+  wrap.addEventListener("wheel", (ev) => {
+    ev.preventDefault();
+    const factor = ev.deltaY > 0 ? 1.12 : 1 / 1.12;
+    zoomBy(factor, ev.clientX, ev.clientY);
+  }, { passive: false });
+
+  document.getElementById("zoom-in").onclick = () => zoomBy(1 / 1.3);
+  document.getElementById("zoom-out").onclick = () => zoomBy(1.3);
+  document.getElementById("zoom-fit").onclick = () => { view = computeBBox(); applyView(); };
+  document.getElementById("zoom-reset").onclick = () => { view = { ...nativeView }; applyView(); };
+
+  // ---- panning ----
+  let panState = null;
+  wrap.addEventListener("pointerdown", (ev) => {
+    if (ev.target.closest(".entity")) return;
+    panState = { startClient: { x: ev.clientX, y: ev.clientY }, startView: { ...view } };
+    wrap.classList.add("panning");
+    wrap.setPointerCapture(ev.pointerId);
+  });
+  wrap.addEventListener("pointermove", (ev) => {
+    if (!panState) return;
+    const a = clientToSvg(panState.startClient.x, panState.startClient.y);
+    const b = clientToSvg(ev.clientX, ev.clientY);
+    view.x = panState.startView.x - (b.x - a.x);
+    view.y = panState.startView.y - (b.y - a.y);
+    applyView();
+  });
+  function endPan(ev) {
+    panState = null;
+    wrap.classList.remove("panning");
+  }
+  wrap.addEventListener("pointerup", endPan);
+  wrap.addEventListener("pointercancel", endPan);
+
+  // ---- node dragging ----
+  let dragState = null;
+  nodeLayer.addEventListener("pointerdown", (ev) => {
+    const g = ev.target.closest(".entity");
+    if (!g) return;
+    ev.stopPropagation();
+    const id = g.getAttribute("data-id");
+    const start = clientToSvg(ev.clientX, ev.clientY);
+    dragState = { id, offsetX: start.x - nodesById[id].x, offsetY: start.y - nodesById[id].y, pointerId: ev.pointerId };
+    g.setPointerCapture(ev.pointerId);
+  });
+  nodeLayer.addEventListener("pointermove", (ev) => {
+    if (!dragState) return;
+    const p = clientToSvg(ev.clientX, ev.clientY);
+    const n = nodesById[dragState.id];
+    n.x = p.x - dragState.offsetX;
+    n.y = p.y - dragState.offsetY;
+    nodeGroups[dragState.id].setAttribute("transform", `translate(${n.x},${n.y})`);
+    refreshEdges();
+  });
+  function endDrag() { dragState = null; }
+  nodeLayer.addEventListener("pointerup", endDrag);
+  nodeLayer.addEventListener("pointercancel", endDrag);
+
+  // ---- selection / highlight ----
+  function clearSelection() {
+    for (const id in nodeGroups) nodeGroups[id].classList.remove("dim", "selected");
+    for (const key in edgeEls) edgeEls[key].g.classList.remove("dim", "highlight");
+  }
+  function selectEntity(id) {
+    const connected = new Set([id]);
+    for (const key in edgeEls) {
+      const { e, g } = edgeEls[key];
+      if (e.source === id || e.target === id) {
+        connected.add(e.source); connected.add(e.target);
+        g.classList.add("highlight"); g.classList.remove("dim");
+      } else {
+        g.classList.add("dim"); g.classList.remove("highlight");
+      }
+    }
+    for (const nid in nodeGroups) {
+      if (connected.has(nid)) nodeGroups[nid].classList.remove("dim");
+      else nodeGroups[nid].classList.add("dim");
+      nodeGroups[nid].classList.toggle("selected", nid === id);
+    }
+  }
+
+  let clickMoved = false;
+  nodeLayer.addEventListener("pointerdown", () => { clickMoved = false; });
+  nodeLayer.addEventListener("pointermove", () => { if (dragState) clickMoved = true; });
+  nodeLayer.addEventListener("click", (ev) => {
+    const g = ev.target.closest(".entity");
+    if (!g || clickMoved) return;
+    const id = g.getAttribute("data-id");
+    if (g.classList.contains("selected")) clearSelection();
+    else selectEntity(id);
+  });
+  wrap.addEventListener("click", (ev) => {
+    if (!ev.target.closest(".entity")) clearSelection();
+  });
+
+  // ---- search ----
+  const searchInput = document.getElementById("search");
+  const matchCountEl = document.getElementById("match-count");
+  searchInput.addEventListener("input", () => {
+    const q = searchInput.value.trim().toLowerCase();
+    if (!q) {
+      for (const id in nodeGroups) nodeGroups[id].classList.remove("search-match", "dim");
+      matchCountEl.textContent = "";
+      return;
+    }
+    let count = 0;
+    for (const id in nodesById) {
+      const n = nodesById[id];
+      const nameMatch = n.name.toLowerCase().includes(q);
+      const attrMatch = n.attrs.some(a => a.toLowerCase().includes(q));
+      const isMatch = nameMatch || attrMatch;
+      nodeGroups[id].classList.toggle("search-match", isMatch);
+      nodeGroups[id].classList.toggle("dim", !isMatch);
+      if (isMatch) count++;
+    }
+    matchCountEl.textContent = count + (count === 1 ? " resultado" : " resultados");
+  });
+
+  document.getElementById("stats").textContent =
+    `${Object.keys(entities).length} tablas · ${edges.length} relaciones`;
+}
+</script>
+</body>
+</html>
